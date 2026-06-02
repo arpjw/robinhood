@@ -8,17 +8,21 @@ Prediction market crowds (Kalshi, Polymarket) reprice discrete events — Fed de
 
 ## Architecture
 
-```
-Kalshi REST API ──┐
-                  ├──► VelocityTracker ──► SignalDeduplicator ──► Sizer ──► MCPClient ──► Robinhood
-Polymarket CLOB ──┘                                                              │
-                                                                                 └──► ExitManager
+```mermaid
+flowchart LR
+    K[Kalshi REST API] --> V[VelocityTracker]
+    P[Polymarket CLOB] --> V
+    V --> D[SignalDeduplicator]
+    D --> S[Sizer]
+    S --> M[MCPClient]
+    M --> R[Robinhood]
+    M --> E[ExitManager]
 ```
 
 ## Quickstart
 
 ```bash
-git clone <repo>
+git clone https://github.com/arpjw/robinhood
 pip install -r requirements.txt
 cp .env.example .env
 # Fill in KALSHI_API_KEY, KALSHI_PRIVATE_KEY_PATH, and other vars
@@ -67,7 +71,7 @@ scripts/
   fetch_kalshi_history.py  # Fetch historical candlestick data
   discover_mcp_tools.py    # List available Robinhood MCP tools
   healthcheck.py           # Pre-flight system check
-logging/
+applog/
   logger.py              # Centralized structured logging
 data/
   contract_equity_map.json  # Hand-curated contract → equity mapping
