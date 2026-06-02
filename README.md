@@ -4,7 +4,7 @@ Captures the latency gap between prediction market repricing and equity market r
 
 ## How It Works
 
-Prediction market crowds (Kalshi, Polymarket) reprice discrete events — Fed decisions, CPI prints, election outcomes — faster than equity markets. When a contract's implied probability shifts sharply, the correlated equity basket hasn't fully repriced yet. This engine detects those velocity spikes and submits market orders via the Robinhood Agentic Trading MCP before the gap closes. Positions are exited by time decay (default 2 hours) or adverse price move (default 3%), whichever triggers first.
+Prediction market crowds (Kalshi, Polymarket) reprice discrete events like Fed decisions, CPI prints, and election outcomes faster than equity markets. When a contract's implied probability shifts sharply, the correlated equity basket hasn't fully repriced yet. This engine detects those velocity spikes and submits market orders via the Robinhood Agentic Trading MCP before the gap closes. Positions are exited by time decay (default 2 hours) or adverse price move (default 3%), whichever triggers first.
 
 ## Architecture
 
@@ -34,13 +34,13 @@ python main.py --dry-run
 
 | Variable | Description | Default |
 |---|---|---|
-| `KALSHI_API_KEY` | RSA key ID from Kalshi dashboard | — |
-| `KALSHI_PRIVATE_KEY_PATH` | Path to RSA private key PEM file | — |
+| `KALSHI_API_KEY` | RSA key ID from Kalshi dashboard | required |
+| `KALSHI_PRIVATE_KEY_PATH` | Path to RSA private key PEM file | required |
 | `KALSHI_TICKERS` | Comma-separated Kalshi market tickers to track | all from contract map |
 | `KALSHI_DEBUG_AUTH` | Print auth debug info on each request | `0` |
-| `POLYMARKET_API_KEY` | Polymarket API key | — |
-| `POLYMARKET_ADDRESS` | Polymarket wallet address | — |
-| `POLYMARKET_CONDITION_IDS` | Comma-separated Polymarket condition IDs to track | — |
+| `POLYMARKET_API_KEY` | Polymarket API key | required |
+| `POLYMARKET_ADDRESS` | Polymarket wallet address | required |
+| `POLYMARKET_CONDITION_IDS` | Comma-separated Polymarket condition IDs to track | required |
 | `EXECUTION_MODE` | `mock` or `live` | `mock` |
 | `ROBINHOOD_MCP_URL` | Robinhood MCP endpoint (required for live) | `https://agent.robinhood.com/mcp/trading` |
 | `VELOCITY_THRESHOLD` | Minimum Δp/Δt to fire signal | `0.15` |
