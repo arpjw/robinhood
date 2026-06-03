@@ -290,6 +290,56 @@ Position sizing now adjusts confidence dynamically based on how far the contract
 
 ---
 
+## Prism Connectors
+
+The `.prism` format is the connector plugin system for this engine. Any data source that produces a time series of values in `[0.0, 1.0]` — prediction market contracts, economic indicators, alternative data feeds — can be packaged as a `.prism` connector and dropped into the engine without modifying core code. Connectors are self-describing: each package carries its own YAML manifest, authentication requirements, and contract-slug declarations. The registry loads them at startup, validates auth, and wires them directly into the shared `VelocityTracker`. This keeps the signal engine itself stable while making the source layer fully extensible.
+
+### Package Structure
+
+A `.prism` package is a directory whose name ends in `.prism`:
+
+```
+my_source.prism/
+├── connector.prism   # YAML manifest: name, slug, version, transport, auth fields, contract slugs
+├── __init__.py       # Python connector class subclassing PrismConnector; implements start/stop/health_check
+└── README.md         # Human description, required env vars, normalization notes, contract slug rationale
+```
+
+### Developer Commands
+
+Scaffold a new connector skeleton (creates the directory, manifest, and stub class):
+
+```bash
+python -m prism_sdk.scaffold --name "My Source" --slug my_source --type custom --transport rest
+```
+
+Validate a connector package without running the engine (checks manifest, imports, slug match, contract slugs, README auth docs):
+
+```bash
+python -m prism_sdk.validator --path connectors/my_source.prism
+```
+
+Drop a finished connector into the engine by placing it in `connectors/custom/`. It will be loaded automatically on next startup:
+
+```bash
+mv my_source.prism connectors/custom/
+python main.py --dry-run
+```
+
+### Built-in Connectors
+
+| Name | Slug | Source | Transport | Auth Required | Description |
+|------|------|--------|-----------|---------------|-------------|
+| `kalshi_fed.prism` | `kalshi_fed` | Kalshi | WebSocket + REST | Yes (`KALSHI_API_KEY`, `KALSHI_PRIVATE_KEY_PATH`) | Streams Fed rate decision contracts from Kalshi with RSA-PSS auth and REST fallback |
+| `polymarket_macro.prism` | `polymarket_macro` | Polymarket CLOB | WebSocket + REST | Optional (`POLYMARKET_API_KEY`) | Streams macro-event contracts from the Polymarket CLOB order book with REST fallback |
+| `metaculus_macro.prism` | `metaculus_macro` | Metaculus | REST | None | Polls macroeconomic forecast questions from Metaculus and maps community predictions to probability |
+| `manifold_macro.prism` | `manifold_macro` | Manifold Markets | REST | None | Polls macro prediction markets from Manifold and normalizes mana-denominated probabilities to `[0, 1]` |
+| `fred_macro.prism` | `fred_macro` | FRED API | REST | Yes (`FRED_API_KEY`) | Fetches FRED economic series (CPI, unemployment, etc.) and normalizes via rolling 52-week min-max to probability signals |
+
+For the full developer guide including manifest field reference, normalization requirements, and the `PrismConnector` interface contract, see [CONTRIBUTING_CONNECTORS.md](CONTRIBUTING_CONNECTORS.md).
+
+---
+
 ## Quickstart
 
 ```bash
