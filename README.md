@@ -139,14 +139,23 @@ The deduplication key is the equity basket, not the contract. Two different cont
 
 ```mermaid
 flowchart LR
-    K[Kalshi REST API] --> V[VelocityTracker]
+    KW[Kalshi WebSocket] --> V[VelocityTracker]
+    KR[Kalshi REST fallback] --> V
     P[Polymarket CLOB] --> V
     V --> D[SignalDeduplicator]
-    D --> S[Sizer]
+    D --> A[Alerter]
+    D --> S[Sizer + ConfidenceDecay]
     S --> M[MCPClient]
     M --> R[Robinhood]
     M --> E[ExitManager]
+    A --> WH[Discord/Slack Webhook]
 ```
+
+**Kalshi poller** connects via WebSocket first (`KALSHI_USE_WEBSOCKET=true` by default), falling back to REST polling after 5 failed connection attempts. The WebSocket feed delivers real-time ticker updates without polling overhead, which reduces the latency between a contract price move and the signal firing.
+
+**Alerter** fires fire-and-forget webhook notifications (Discord or Slack) when signals, orders, and exits occur. It runs as an async task with a 3-second timeout and never blocks signal processing.
+
+**Confidence decay** adjusts the static confidence value from the contract map based on how central the current price is within its 7-day range. A contract trading near its 7-day extreme gets half the base confidence; a contract near its midpoint gets full confidence. This reduces position size when information may already be priced in.
 
 **Kalshi poller and Polymarket poller** are separate modules because the two APIs have different authentication schemes, rate limits, data formats, and WebSocket semantics. Keeping them separate means a change to one does not risk breaking the other, and either can be disabled independently.
 
@@ -184,6 +193,30 @@ The safety model has four independent layers. First, mock mode is the default an
 
 ---
 
+## V2 Improvements
+
+### WebSocket Streaming
+
+The Kalshi poller now connects via WebSocket (`wss://api.elections.kalshi.com/trade-api/v2/ws/v2`) and streams ticker updates in real time instead of polling every 30 seconds. This tightens the critical latency path between a contract repricing and the signal firing. If the WebSocket connection fails 5 times with exponential backoff (1s, 2s, 4s, 8s, 16s), the engine logs a warning and falls back to REST polling automatically. Set `KALSHI_USE_WEBSOCKET=false` to force REST mode for debugging.
+
+### Alerting
+
+Add `ALERT_WEBHOOK_URL` pointing to a Discord or Slack incoming webhook. When set, the engine sends structured notifications on signal fires, order submissions, and exit events. Discord URLs get rich embed payloads with color-coded severity. Slack URLs get plain JSON compatible with incoming webhooks. All webhook calls are fire-and-forget with a 3-second timeout so a slow webhook never blocks signal processing. Disable with `ALERTS_ENABLED=false`.
+
+### Slippage and Fill Modeling
+
+`backtest/simulate.py` now models realistic execution costs. Entry and exit prices reflect slippage, spread costs, and execution latency. Run with `--realistic` (10 bps slippage, 5s latency, 5 bps spread, 30 bps total round-trip) or `--optimistic` (all costs zero) to compare. The backtest JSON output includes an `execution_assumptions` section listing exact cost parameters used.
+
+### Live Performance Dashboard
+
+`scripts/dashboard.py` renders a terminal dashboard from `logs/orders.jsonl` using rich. It refreshes every 5 seconds and shows summary metrics, per-contract win rates, velocity bucket analysis, open positions with unrealized P&L from yfinance, and a recent activity feed. Run `python scripts/dashboard.py` during mock mode to build intuition on which signal types fire cleanest before going live.
+
+### Confidence Decay
+
+Position sizing now adjusts confidence dynamically based on how far the contract price is from its 7-day midpoint. A contract at a 7-day extreme (implying the information is already priced in) gets half the base confidence. A contract near its midpoint gets full confidence. This reduces position size when signals carry less incremental information content. Disable with `CONFIDENCE_DECAY_ENABLED=false` to use the static map values.
+
+---
+
 ## Quickstart
 
 ```bash
@@ -193,11 +226,16 @@ cp .env.example .env
 # Fill in KALSHI_API_KEY, KALSHI_PRIVATE_KEY_PATH, and other vars
 python scripts/healthcheck.py
 python main.py --dry-run
+
+# Monitor mock performance in a separate terminal:
+python scripts/dashboard.py
 ```
 
 `scripts/healthcheck.py` validates that credentials are set, that the Kalshi API is reachable, and that the contract equity map loads without errors. Run it before every session to catch configuration issues before the main loop starts.
 
 `--dry-run` runs the full pipeline in mock mode and exits after the first signal fires (or after a timeout). It is useful for verifying that the end-to-end plumbing is working without leaving the engine running indefinitely.
+
+`scripts/dashboard.py` reads `logs/orders.jsonl` and displays live performance metrics. Run it alongside the engine in mock mode to monitor signal quality and P&L accumulation before enabling live trading.
 
 ---
 
@@ -221,6 +259,13 @@ python main.py --dry-run
 | `EXIT_CHECK_INTERVAL_SECONDS` | How often the exit manager checks open positions | `60` | Should be significantly shorter than the exit time window |
 | `PORTFOLIO_VALUE` | Total capital base for position sizing | `10000` | Used in the sizing formula; should reflect actual account size |
 | `MAX_POSITION_PCT` | Maximum allocation per position as a fraction of portfolio | `0.05` | 0.05 means no single position exceeds 5% of portfolio value |
+| `KALSHI_USE_WEBSOCKET` | Use WebSocket feed instead of REST polling | `true` | Set to `false` to force REST polling for debugging |
+| `ALERT_WEBHOOK_URL` | Discord or Slack incoming webhook URL for notifications | `""` | Discord URLs get embed payloads; Slack URLs get plain JSON |
+| `ALERTS_ENABLED` | Enable or disable webhook alerting | `true` | Set to `false` to silence notifications without removing the URL |
+| `BACKTEST_SLIPPAGE_BPS` | Entry/exit slippage per side in basis points | `10` | Overridden by `--realistic` or `--optimistic` flags |
+| `BACKTEST_LATENCY_SECONDS` | Execution latency between signal fire and fill | `5` | Applied as timestamp offset when looking up fill price |
+| `BACKTEST_SPREAD_BPS` | One-way spread cost applied at entry and exit | `5` | Combined with slippage; total round-trip = 2×spread + 2×slippage |
+| `CONFIDENCE_DECAY_ENABLED` | Adjust confidence by 7-day price centrality | `true` | Set to `false` to use static confidence values from the contract map |
 
 ---
 
@@ -228,24 +273,27 @@ python main.py --dry-run
 
 ```
 signals/
-  kalshi_poller.py       # Kalshi REST polling with RSA-PSS auth
+  kalshi_poller.py       # Kalshi WebSocket + REST fallback with RSA-PSS auth
   polymarket_poller.py   # Polymarket CLOB polling
   velocity.py            # Δp/Δt computation and threshold filtering
   contract_mapper.py     # contract to equity basket lookup
   deduplicator.py        # cross-source duplicate suppression
+  confidence_decay.py    # 7-day centrality-based confidence adjustment
 execution/
   mcp_client.py          # Mock and Live MCP client implementations
   order_schema.py        # Typed OrderRecord dataclass and log I/O
-  sizer.py               # Velocity-weighted position sizing
+  sizer.py               # Velocity-weighted position sizing with confidence decay
   exit_manager.py        # Time-decay and adverse-move exit logic
 backtest/
-  simulate.py            # Historical signal replay with P&L analysis
+  simulate.py            # Historical signal replay with slippage/fill modeling
 scripts/
+  dashboard.py           # Rich terminal dashboard for live P&L monitoring
   fetch_kalshi_history.py  # Fetch historical candlestick data from Kalshi
   discover_mcp_tools.py    # List available Robinhood MCP tools
   healthcheck.py           # Pre-flight system check
 applog/
   logger.py              # Centralized structured logging to JSONL
+  alerter.py             # Discord/Slack webhook notifications
 data/
   contract_equity_map.json  # Hand-curated contract to equity mapping
 logs/                    # Runtime logs (signals.jsonl, orders.jsonl, errors.jsonl)

@@ -10,6 +10,8 @@ from typing import Awaitable, Callable
 from urllib.parse import urlparse
 
 import httpx
+from websockets.asyncio.client import connect as ws_connect, ClientConnection
+import websockets.exceptions
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
@@ -19,8 +21,16 @@ from signals.velocity import PricePoint, VelocitySignal, VelocityTracker
 KALSHI_BASE_URL = os.getenv(
     "KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2"
 )
+KALSHI_WS_URL = os.getenv(
+    "KALSHI_WS_URL", "wss://api.elections.kalshi.com/trade-api/v2/ws/v2"
+)
 SIGNAL_LOG_PATH = Path(os.getenv("SIGNAL_LOG_PATH", "logs/signals.jsonl"))
 DEBUG_AUTH = os.getenv("KALSHI_DEBUG_AUTH", "").lower() in ("1", "true", "yes")
+_USE_WEBSOCKET = os.getenv("KALSHI_USE_WEBSOCKET", "true").lower() not in ("0", "false", "no")
+
+_WS_MAX_ATTEMPTS = 5
+_WS_BACKOFF_INITIAL = 1.0
+_WS_BACKOFF_MAX = 60.0
 
 logger = logging.getLogger(__name__)
 
@@ -101,16 +111,112 @@ class KalshiPoller:
         tracked_tickers: list[str],
         tracker: VelocityTracker,
         private_key_path: str | None = None,
+        use_websocket: bool = _USE_WEBSOCKET,
     ) -> None:
         self._key_id = api_key
         self._tracked = tracked_tickers
         self._tracker = tracker
+        self._use_websocket = use_websocket
         private_key_path = private_key_path or os.getenv("KALSHI_PRIVATE_KEY_PATH")
         if not private_key_path:
             raise ValueError(
                 "KALSHI_PRIVATE_KEY_PATH must be set — Kalshi v2 requires RSA-PSS signing"
             )
         self._private_key = _load_private_key(private_key_path)
+
+    def _ws_auth_headers(self) -> dict[str, str]:
+        auth_url = KALSHI_WS_URL.replace("wss://", "https://")
+        return _sign_request(self._key_id, self._private_key, "GET", auth_url)
+
+    async def _send_subscribe(self, ws: ClientConnection) -> None:
+        msg = {
+            "id": 1,
+            "cmd": "subscribe",
+            "params": {
+                "channels": ["ticker", "orderbook_delta"],
+                "market_tickers": self._tracked,
+            },
+        }
+        await ws.send(json.dumps(msg))
+
+    async def _handle_ws_message(
+        self,
+        raw: str,
+        on_signal: Callable[[VelocitySignal], Awaitable[None]],
+    ) -> None:
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return
+
+        if data.get("type") != "ticker":
+            return
+
+        msg = data.get("msg", {})
+        market_ticker = msg.get("market_ticker")
+        yes_price = msg.get("yes_price")
+        volume = msg.get("volume", 0)
+
+        if market_ticker not in self._tracked or yes_price is None:
+            return
+
+        now = datetime.now(tz=timezone.utc)
+        point = PricePoint(
+            timestamp=now,
+            price=_normalize_price(int(yes_price)),
+            volume=int(volume),
+        )
+        signal = self._tracker.update(market_ticker, point)
+        if signal is not None:
+            _log_signal(signal)
+            await on_signal(signal)
+
+    async def _run_websocket(
+        self,
+        on_signal: Callable[[VelocitySignal], Awaitable[None]],
+    ) -> bool:
+        attempts = 0
+        backoff = _WS_BACKOFF_INITIAL
+
+        while attempts < _WS_MAX_ATTEMPTS:
+            try:
+                headers = self._ws_auth_headers()
+                async with ws_connect(
+                    KALSHI_WS_URL,
+                    additional_headers=headers,
+                ) as ws:
+                    await self._send_subscribe(ws)
+                    attempts = 0
+                    backoff = _WS_BACKOFF_INITIAL
+                    async for raw in ws:
+                        await self._handle_ws_message(raw, on_signal)
+            except (
+                websockets.exceptions.WebSocketException,
+                websockets.exceptions.ConnectionClosed,
+                OSError,
+            ) as exc:
+                attempts += 1
+                logger.warning(
+                    "WebSocket error (attempt %d/%d): %s",
+                    attempts,
+                    _WS_MAX_ATTEMPTS,
+                    exc,
+                )
+                if attempts >= _WS_MAX_ATTEMPTS:
+                    break
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _WS_BACKOFF_MAX)
+
+        return False
+
+    async def _run_rest(
+        self,
+        interval_seconds: float,
+        on_signal: Callable[[VelocitySignal], Awaitable[None]],
+    ) -> None:
+        while True:
+            await self.poll_once(on_signal)
+            await asyncio.sleep(interval_seconds)
 
     async def _fetch_market(
         self, client: httpx.AsyncClient, ticker: str
@@ -165,6 +271,13 @@ class KalshiPoller:
         interval_seconds: float,
         on_signal: Callable[[VelocitySignal], Awaitable[None]],
     ) -> None:
-        while True:
-            await self.poll_once(on_signal)
-            await asyncio.sleep(interval_seconds)
+        if self._use_websocket:
+            ws_ok = await self._run_websocket(on_signal)
+            if not ws_ok:
+                logger.warning(
+                    "WebSocket unavailable after %d attempts; falling back to REST polling",
+                    _WS_MAX_ATTEMPTS,
+                )
+                await self._run_rest(interval_seconds, on_signal)
+        else:
+            await self._run_rest(interval_seconds, on_signal)

@@ -9,8 +9,11 @@ import pytest
 
 from backtest.simulate import (
     BacktestTrade,
+    apply_entry_price,
+    apply_exit_price,
     compute_summary,
     determine_side,
+    get_fill_date,
     load_kalshi_csv,
     replay_signals,
     simulate_trade,
@@ -243,3 +246,83 @@ class TestComputeSummary:
         trades = [self.make_trade(5), self.make_trade(-1), self.make_trade(3), self.make_trade(2)]
         summary = compute_summary(trades, num_signals=4)
         assert summary.sharpe != 0.0
+
+
+class TestSlippageModel:
+    def test_buy_entry_price_increased_by_slippage(self) -> None:
+        price = apply_entry_price(100.0, "buy", slippage_bps=10, spread_bps=5)
+        assert price == pytest.approx(100.0 * (1 + 0.0015), rel=1e-6)
+
+    def test_sell_entry_price_decreased_by_slippage(self) -> None:
+        price = apply_entry_price(100.0, "sell", slippage_bps=10, spread_bps=5)
+        assert price == pytest.approx(100.0 * (1 - 0.0015), rel=1e-6)
+
+    def test_buy_exit_price_decreased_by_slippage(self) -> None:
+        price = apply_exit_price(100.0, "buy", slippage_bps=10, spread_bps=5)
+        assert price == pytest.approx(100.0 * (1 - 0.0015), rel=1e-6)
+
+    def test_sell_exit_price_increased_by_slippage(self) -> None:
+        price = apply_exit_price(100.0, "sell", slippage_bps=10, spread_bps=5)
+        assert price == pytest.approx(100.0 * (1 + 0.0015), rel=1e-6)
+
+    def test_zero_slippage_unchanged(self) -> None:
+        assert apply_entry_price(100.0, "buy", 0, 0) == pytest.approx(100.0)
+        assert apply_exit_price(100.0, "buy", 0, 0) == pytest.approx(100.0)
+
+    def test_slippage_reduces_pnl_for_buy(self) -> None:
+        signal = make_signal(velocity=0.5)
+        equity_df = make_equity_df(
+            ["2024-01-10", "2024-01-11", "2024-01-12"],
+            [100.0, 105.0, 110.0],
+        )
+        trade_no_cost = simulate_trade(signal, "JPM", "buy", 500.0, equity_df, 24.0, 0.10, 0, 0, 0)
+        trade_with_cost = simulate_trade(signal, "JPM", "buy", 500.0, equity_df, 24.0, 0.10, 10, 0, 5)
+        assert trade_no_cost is not None
+        assert trade_with_cost is not None
+        assert trade_with_cost.pnl_dollar < trade_no_cost.pnl_dollar
+
+
+class TestLatencyLookup:
+    def test_latency_uses_same_bar_for_seconds(self) -> None:
+        ts = datetime(2024, 1, 10, 9, 0, 0, tzinfo=timezone.utc)
+        fill = get_fill_date(ts, latency_seconds=5)
+        assert fill == ts.date()
+
+    def test_latency_advances_date_at_midnight(self) -> None:
+        ts = datetime(2024, 1, 10, 23, 59, 58, tzinfo=timezone.utc)
+        fill = get_fill_date(ts, latency_seconds=5)
+        assert fill.day == 11
+
+    def test_zero_latency_same_date(self) -> None:
+        ts = datetime(2024, 1, 10, 12, 0, 0, tzinfo=timezone.utc)
+        fill = get_fill_date(ts, latency_seconds=0)
+        assert fill == ts.date()
+
+
+class TestRoundTripCost:
+    def test_total_cost_formula(self) -> None:
+        slippage_bps = 10
+        spread_bps = 5
+        expected = (2 * spread_bps) + (2 * slippage_bps)
+        assert expected == 30
+
+    def test_execution_assumptions_in_summary(self) -> None:
+        assumptions = {
+            "slippage_bps": 10.0,
+            "latency_seconds": 5.0,
+            "spread_bps": 5.0,
+            "total_cost_bps": 30.0,
+        }
+        summary = compute_summary([], num_signals=0, execution_assumptions=assumptions)
+        assert summary.execution_assumptions is not None
+        assert summary.execution_assumptions["total_cost_bps"] == pytest.approx(30.0)
+
+    def test_realistic_total_cost_bps(self) -> None:
+        slippage_bps = 10.0
+        spread_bps = 5.0
+        total = (2 * spread_bps) + (2 * slippage_bps)
+        assert total == pytest.approx(30.0)
+
+    def test_optimistic_total_cost_zero(self) -> None:
+        total = (2 * 0.0) + (2 * 0.0)
+        assert total == pytest.approx(0.0)

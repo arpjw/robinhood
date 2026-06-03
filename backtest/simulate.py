@@ -11,6 +11,8 @@ Usage:
     python -m backtest.simulate --kalshi-csv data/kalshi_history.csv
     python -m backtest.simulate --kalshi-csv data/kalshi_history.csv --output results/backtest.json
     python -m backtest.simulate --kalshi-csv data/kalshi_history.csv --plot
+    python -m backtest.simulate --kalshi-csv data/kalshi_history.csv --realistic
+    python -m backtest.simulate --kalshi-csv data/kalshi_history.csv --optimistic
 """
 
 from __future__ import annotations
@@ -36,6 +38,9 @@ VELOCITY_THRESHOLD = float(os.getenv("VELOCITY_THRESHOLD", "0.15"))
 VELOCITY_WINDOW_MINUTES = int(os.getenv("VELOCITY_WINDOW_MINUTES", "5"))
 PORTFOLIO_VALUE = float(os.getenv("PORTFOLIO_VALUE", "10000"))
 MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.05"))
+BACKTEST_SLIPPAGE_BPS = float(os.getenv("BACKTEST_SLIPPAGE_BPS", "10"))
+BACKTEST_LATENCY_SECONDS = float(os.getenv("BACKTEST_LATENCY_SECONDS", "5"))
+BACKTEST_SPREAD_BPS = float(os.getenv("BACKTEST_SPREAD_BPS", "5"))
 
 
 @dataclass
@@ -77,6 +82,31 @@ class BacktestSummary:
     trades: list[BacktestTrade]
     per_slug: list[SlugBreakdown] | None = None
     signal_decay_curve: list[dict] | None = None
+    execution_assumptions: dict | None = None
+
+
+def apply_entry_price(
+    price: float,
+    side: str,
+    slippage_bps: float,
+    spread_bps: float,
+) -> float:
+    cost = (slippage_bps + spread_bps) / 10000.0
+    return price * (1.0 + cost) if side == "buy" else price * (1.0 - cost)
+
+
+def apply_exit_price(
+    price: float,
+    side: str,
+    slippage_bps: float,
+    spread_bps: float,
+) -> float:
+    cost = (slippage_bps + spread_bps) / 10000.0
+    return price * (1.0 - cost) if side == "buy" else price * (1.0 + cost)
+
+
+def get_fill_date(signal_ts: datetime, latency_seconds: float) -> datetime.date:
+    return (signal_ts + timedelta(seconds=latency_seconds)).date()
 
 
 def load_kalshi_csv(path: str) -> pd.DataFrame:
@@ -146,16 +176,20 @@ def simulate_trade(
     equity_df: pd.DataFrame,
     exit_hours: float,
     exit_adverse_pct: float,
+    slippage_bps: float = 0.0,
+    latency_seconds: float = 0.0,
+    spread_bps: float = 0.0,
 ) -> BacktestTrade | None:
-    signal_date = pd.Timestamp(signal.timestamp.date())
-    future = equity_df[equity_df.index >= signal_date]
+    fill_date = pd.Timestamp(get_fill_date(signal.timestamp, latency_seconds))
+    future = equity_df[equity_df.index >= fill_date]
     if future.empty:
         return None
 
     entry_row = future.iloc[0]
-    entry_price = float(entry_row["Open"])
-    if entry_price <= 0:
+    raw_entry = float(entry_row["Open"])
+    if raw_entry <= 0:
         return None
+    entry_price = apply_entry_price(raw_entry, side, slippage_bps, spread_bps)
     entry_date = future.index[0].date().isoformat()
     exit_trading_days = max(1, math.ceil(exit_hours / 6.5))
 
@@ -166,9 +200,9 @@ def simulate_trade(
     for i, (_, bar) in enumerate(bars_after.iterrows()):
         close = float(bar["Close"])
         if side == "buy":
-            move = (close - entry_price) / entry_price
+            move = (close - raw_entry) / raw_entry
         else:
-            move = (entry_price - close) / entry_price
+            move = (raw_entry - close) / raw_entry
 
         if move <= -exit_adverse_pct:
             exit_idx = i
@@ -190,7 +224,9 @@ def simulate_trade(
         exit_row = entry_row
         exit_date = entry_date
 
-    exit_price = float(exit_row["Close"])
+    raw_exit = float(exit_row["Close"])
+    exit_price = apply_exit_price(raw_exit, side, slippage_bps, spread_bps)
+
     if side == "buy":
         pnl_pct = (exit_price - entry_price) / entry_price
     else:
@@ -265,6 +301,7 @@ def compute_summary(
     trades: list[BacktestTrade],
     num_signals: int,
     min_trades: int = 0,
+    execution_assumptions: dict | None = None,
 ) -> BacktestSummary:
     if not trades:
         return BacktestSummary(
@@ -278,6 +315,7 @@ def compute_summary(
             trades=[],
             per_slug=[],
             signal_decay_curve=[],
+            execution_assumptions=execution_assumptions,
         )
     winning = sum(1 for t in trades if t.pnl_dollar > 0)
     total_pnl = sum(t.pnl_dollar for t in trades)
@@ -295,6 +333,7 @@ def compute_summary(
         trades=trades,
         per_slug=compute_per_slug(trades, min_trades),
         signal_decay_curve=compute_signal_decay_curve(trades),
+        execution_assumptions=execution_assumptions,
     )
 
 
@@ -356,13 +395,23 @@ def run_backtest(
     portfolio_value: float = PORTFOLIO_VALUE,
     max_position_pct: float = MAX_POSITION_PCT,
     min_trades: int = 0,
+    slippage_bps: float = BACKTEST_SLIPPAGE_BPS,
+    latency_seconds: float = BACKTEST_LATENCY_SECONDS,
+    spread_bps: float = BACKTEST_SPREAD_BPS,
 ) -> tuple[BacktestSummary, list[VelocitySignal]]:
     kalshi_df = load_kalshi_csv(kalshi_csv)
     mapper = ContractMapper(contract_map_path)
     signals = replay_signals(kalshi_df, mapper, threshold, window_minutes)
 
+    execution_assumptions = {
+        "slippage_bps": slippage_bps,
+        "latency_seconds": latency_seconds,
+        "spread_bps": spread_bps,
+        "total_cost_bps": (2 * spread_bps) + (2 * slippage_bps),
+    }
+
     if not signals:
-        return compute_summary([], 0, min_trades), []
+        return compute_summary([], 0, min_trades, execution_assumptions), []
 
     all_baskets = [mapper.get_basket(s.contract_slug) for s in signals]
     all_tickers: list[str] = []
@@ -395,11 +444,14 @@ def run_backtest(
                 equity_df=eq_df,
                 exit_hours=float(basket.get("exit_hours", 2.0)),
                 exit_adverse_pct=float(basket.get("exit_adverse_pct", 0.03)),
+                slippage_bps=slippage_bps,
+                latency_seconds=latency_seconds,
+                spread_bps=spread_bps,
             )
             if trade is not None:
                 trades.append(trade)
 
-    return compute_summary(trades, len(signals), min_trades), signals
+    return compute_summary(trades, len(signals), min_trades, execution_assumptions), signals
 
 
 def main() -> None:
@@ -416,7 +468,43 @@ def main() -> None:
         "--min-trades", type=int, default=5,
         help="Exclude slugs with fewer than N trades from per-slug summary (default: 5)"
     )
+    parser.add_argument(
+        "--slippage-bps", type=float, default=None,
+        help="Entry/exit slippage in basis points (default from env)"
+    )
+    parser.add_argument(
+        "--latency-seconds", type=float, default=None,
+        help="Execution latency in seconds (default from env)"
+    )
+    parser.add_argument(
+        "--spread-bps", type=float, default=None,
+        help="One-way spread cost in basis points (default from env)"
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--realistic",
+        action="store_true",
+        help="Use realistic execution: slippage=10bps, latency=5s, spread=5bps",
+    )
+    mode.add_argument(
+        "--optimistic",
+        action="store_true",
+        help="Use optimistic execution: all costs set to 0 for comparison",
+    )
     args = parser.parse_args()
+
+    if args.realistic:
+        slippage_bps = 10.0
+        latency_seconds = 5.0
+        spread_bps = 5.0
+    elif args.optimistic:
+        slippage_bps = 0.0
+        latency_seconds = 0.0
+        spread_bps = 0.0
+    else:
+        slippage_bps = args.slippage_bps if args.slippage_bps is not None else BACKTEST_SLIPPAGE_BPS
+        latency_seconds = args.latency_seconds if args.latency_seconds is not None else BACKTEST_LATENCY_SECONDS
+        spread_bps = args.spread_bps if args.spread_bps is not None else BACKTEST_SPREAD_BPS
 
     summary, signals = run_backtest(
         kalshi_csv=args.kalshi_csv,
@@ -426,6 +514,9 @@ def main() -> None:
         portfolio_value=args.portfolio_value,
         max_position_pct=args.max_position_pct,
         min_trades=args.min_trades,
+        slippage_bps=slippage_bps,
+        latency_seconds=latency_seconds,
+        spread_bps=spread_bps,
     )
 
     if args.plot:
@@ -441,6 +532,7 @@ def main() -> None:
             "avg_pnl_pct": summary.avg_pnl_pct,
             "sharpe": summary.sharpe,
         },
+        "execution_assumptions": summary.execution_assumptions or {},
         "per_slug": [asdict(s) for s in (summary.per_slug or [])],
         "signal_decay_curve": summary.signal_decay_curve or [],
         "trades": [asdict(t) for t in summary.trades],

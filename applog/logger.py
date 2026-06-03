@@ -3,6 +3,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+from applog.alerter import Alerter
 from execution.order_schema import OrderRecord, update_order_exit
 from signals.velocity import VelocitySignal
 
@@ -15,11 +16,19 @@ class Logger:
         self,
         signal_log: Path = SIGNAL_LOG_PATH,
         order_log: Path = ORDER_LOG_PATH,
+        alerter: Alerter | None = None,
     ) -> None:
         self._signal_log = signal_log
         self._order_log = order_log
+        self._alerter = alerter if alerter is not None else Alerter()
 
-    def log_signal(self, signal: VelocitySignal, source: str) -> None:
+    def log_signal(
+        self,
+        signal: VelocitySignal,
+        source: str,
+        direction: str | None = None,
+        basket: list[str] | None = None,
+    ) -> None:
         self._signal_log.parent.mkdir(parents=True, exist_ok=True)
         record = {
             "timestamp": signal.timestamp.isoformat(),
@@ -36,6 +45,8 @@ class Logger:
             f"[SIGNAL] {signal.timestamp.isoformat()} {signal.contract_slug} "
             f"velocity={signal.velocity:.3f} source={source}"
         )
+        if direction and basket:
+            self._alerter.alert_signal(signal, direction, basket)
 
     def log_order(self, order: OrderRecord) -> None:
         self._order_log.parent.mkdir(parents=True, exist_ok=True)
@@ -45,6 +56,7 @@ class Logger:
             f"[ORDER] {order.timestamp} {order.ticker} {order.side} "
             f"${order.size_usd:.2f} strategy={order.strategy_id}"
         )
+        self._alerter.alert_order(order)
 
     def log_exit(
         self,
@@ -52,6 +64,8 @@ class Logger:
         exit_reason: str,
         exit_price: float,
         pnl_usd: float,
+        ticker: str | None = None,
+        hold_minutes: float | None = None,
     ) -> None:
         update_order_exit(
             order_id=order_id,
@@ -65,3 +79,5 @@ class Logger:
             f"[EXIT] order={order_id} reason={exit_reason} "
             f"exit_price={exit_price:.4f} pnl=${pnl_usd:.2f}"
         )
+        if ticker and hold_minutes is not None:
+            self._alerter.alert_exit(ticker, exit_reason, hold_minutes, pnl_usd)
