@@ -14,11 +14,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from execution.exit_manager import ExitManager, TrackedPosition, yfinance_price_fetcher
+from execution.exposure_manager import ExposureManager
 from execution.mcp_client import make_client
 from execution.sizer import size_basket
 from signals.contract_mapper import ContractMapper
 from signals.deduplicator import SignalDeduplicator
 from signals.kalshi_poller import KalshiPoller
+from signals.market_hours import MarketHoursGuard
 from signals.polymarket_poller import PolymarketPoller
 from signals.velocity import VelocitySignal, VelocityTracker
 
@@ -31,18 +33,21 @@ logger = logging.getLogger(__name__)
 _signal_count = 0
 _order_count = 0
 _tasks: list[asyncio.Task] = []
+_off_hours_queue: list[VelocitySignal] = []
 
 
 def determine_side(velocity: float, direction: str) -> str:
     return "buy" if (velocity > 0) == (direction == "up") else "sell"
 
 
-async def handle_signal(
+async def _submit_signal(
     signal: VelocitySignal,
     mapper: ContractMapper,
     client,
     exit_manager: ExitManager,
     deduplicator: SignalDeduplicator,
+    exposure_manager: ExposureManager,
+    size_multiplier: float = 1.0,
 ) -> None:
     global _signal_count, _order_count
 
@@ -58,6 +63,17 @@ async def handle_signal(
 
     side = determine_side(signal.velocity, basket["direction"])
     sizes = size_basket(basket, velocity=signal.velocity)
+    if size_multiplier != 1.0:
+        sizes = {t: round(s * size_multiplier, 2) for t, s in sizes.items()}
+
+    total_size = sum(sizes.values())
+    can_open, reason = exposure_manager.can_open(signal.contract_slug, total_size)
+    if not can_open:
+        logger.warning(
+            "EXPOSURE LIMIT slug=%s reason=%s", signal.contract_slug, reason
+        )
+        return
+
     strategy_id = f"velocity:{signal.contract_slug}:{signal.timestamp.strftime('%Y%m%dT%H%M%S')}"
 
     logger.info(
@@ -72,6 +88,7 @@ async def handle_signal(
     for ticker, dollar_size in sizes.items():
         order = client.submit_order(ticker, side, dollar_size, strategy_id)
         _order_count += 1
+        exposure_manager.register_open(signal.contract_slug, ticker, dollar_size)
         exit_manager.register(
             TrackedPosition(
                 order_id=order["id"],
@@ -81,6 +98,8 @@ async def handle_signal(
                 entry_time=signal.timestamp,
                 strategy_id=strategy_id,
                 direction=basket["direction"],
+                contract_slug=signal.contract_slug,
+                entry_velocity=signal.velocity,
                 exit_hours=float(basket.get("exit_hours", 2.0)),
                 exit_adverse_pct=float(basket.get("exit_adverse_pct", 0.03)),
                 entry_price=None,
@@ -88,7 +107,76 @@ async def handle_signal(
         )
 
 
-def _print_startup_banner(dry_run: bool, mode: str, tracked: list[str]) -> None:
+async def handle_signal(
+    signal: VelocitySignal,
+    mapper: ContractMapper,
+    client,
+    exit_manager: ExitManager,
+    deduplicator: SignalDeduplicator,
+    exposure_manager: ExposureManager,
+    hours_guard: MarketHoursGuard,
+) -> None:
+    if not hours_guard.is_open():
+        mode = os.getenv("OFF_HOURS_MODE", "suppress")
+        mins = hours_guard.minutes_to_open()
+        if mode == "queue":
+            _off_hours_queue.append(signal)
+            logger.info(
+                "queued off-hours signal slug=%s velocity=%.4f mins_to_open=%s",
+                signal.contract_slug,
+                signal.velocity,
+                f"{mins:.1f}" if mins is not None else "unknown",
+            )
+        else:
+            logger.info(
+                "suppressed off-hours signal slug=%s velocity=%.4f mins_to_open=%s",
+                signal.contract_slug,
+                signal.velocity,
+                f"{mins:.1f}" if mins is not None else "unknown",
+            )
+        return
+
+    await _submit_signal(signal, mapper, client, exit_manager, deduplicator, exposure_manager)
+
+
+async def _queue_replay_worker(
+    hours_guard: MarketHoursGuard,
+    mapper: ContractMapper,
+    client,
+    exit_manager: ExitManager,
+    deduplicator: SignalDeduplicator,
+    exposure_manager: ExposureManager,
+) -> None:
+    was_open = hours_guard.is_open()
+    while True:
+        await asyncio.sleep(30)
+        is_open = hours_guard.is_open()
+        if is_open and not was_open and _off_hours_queue:
+            queued = list(_off_hours_queue)
+            _off_hours_queue.clear()
+            logger.info("market opened — replaying %d queued signals", len(queued))
+            for sig in queued:
+                decay = hours_guard.edge_decay_factor(sig.timestamp)
+                if decay == 0.0:
+                    logger.warning(
+                        "queue replay: dropped stale signal slug=%s (edge decay=0.0)",
+                        sig.contract_slug,
+                    )
+                    continue
+                await _submit_signal(
+                    sig, mapper, client, exit_manager, deduplicator, exposure_manager,
+                    size_multiplier=decay,
+                )
+        was_open = is_open
+
+
+def _print_startup_banner(
+    dry_run: bool,
+    mode: str,
+    tracked: list[str],
+    hours_guard: MarketHoursGuard,
+    exposure_manager: ExposureManager,
+) -> None:
     mapper_path = "data/contract_equity_map.json"
     try:
         contract_count = len(json.loads(Path(mapper_path).read_text()))
@@ -97,6 +185,13 @@ def _print_startup_banner(dry_run: bool, mode: str, tracked: list[str]) -> None:
 
     polymarket_ids = os.getenv("POLYMARKET_CONDITION_IDS", "")
     poly_count = len([x for x in polymarket_ids.split(",") if x.strip()]) if polymarket_ids else 0
+
+    is_open = hours_guard.is_open()
+    market_status = "OPEN" if is_open else "CLOSED"
+    if not is_open:
+        mins = hours_guard.minutes_to_open()
+        if mins is not None:
+            market_status += f" (opens in {mins:.0f}m)"
 
     banner = "DRY RUN MODE — forced mock execution" if dry_run else ""
     print("=" * 60)
@@ -110,6 +205,10 @@ def _print_startup_banner(dry_run: bool, mode: str, tracked: list[str]) -> None:
     print(f"  contracts tracked   : {contract_count}")
     print(f"  kalshi tickers      : {len(tracked)}")
     print(f"  polymarket ids      : {poly_count}")
+    print(f"  market hours status : {market_status}")
+    print(f"  off hours mode      : {os.getenv('OFF_HOURS_MODE', 'suppress')}")
+    print(f"  max factor exposure : {os.getenv('MAX_FACTOR_EXPOSURE_PCT', '0.15')}")
+    print(f"  max total exposure  : {os.getenv('MAX_TOTAL_EXPOSURE_PCT', '0.40')}")
     print("=" * 60)
 
 
@@ -137,11 +236,17 @@ async def main() -> None:
     mapper = ContractMapper()
     client = make_client()
     deduplicator = SignalDeduplicator()
+    exposure_manager = ExposureManager()
+    hours_guard = MarketHoursGuard()
     exit_check_interval = float(os.getenv("EXIT_CHECK_INTERVAL_SECONDS", "60"))
+
+    tracker = VelocityTracker()
     exit_manager = ExitManager(
         client=client,
         price_fetcher=yfinance_price_fetcher,
         check_interval_seconds=exit_check_interval,
+        velocity_tracker=tracker,
+        exposure_manager=exposure_manager,
     )
 
     tickers_env = os.getenv("KALSHI_TICKERS", "")
@@ -154,29 +259,35 @@ async def main() -> None:
             "Set to specific market tickers for production."
         )
 
-    _print_startup_banner(args.dry_run, mode, tracked)
+    _print_startup_banner(args.dry_run, mode, tracked, hours_guard, exposure_manager)
 
     polymarket_env = os.getenv("POLYMARKET_CONDITION_IDS", "")
     condition_ids = [x.strip() for x in polymarket_env.split(",") if x.strip()]
 
-    tracker = VelocityTracker()
     interval = float(os.getenv("POLL_INTERVAL_SECONDS", "30"))
-
     poller = KalshiPoller(api_key=api_key, tracked_tickers=tracked, tracker=tracker)
 
     async def _on_signal(sig: VelocitySignal) -> None:
-        await handle_signal(sig, mapper, client, exit_manager, deduplicator)
+        await handle_signal(
+            sig, mapper, client, exit_manager, deduplicator, exposure_manager, hours_guard
+        )
 
     coroutines = [
         poller.run(interval_seconds=interval, on_signal=_on_signal),
         exit_manager.run(),
     ]
 
+    if os.getenv("OFF_HOURS_MODE", "suppress") == "queue":
+        coroutines.append(
+            _queue_replay_worker(
+                hours_guard, mapper, client, exit_manager, deduplicator, exposure_manager
+            )
+        )
+
     if condition_ids:
-        poly_tracker = VelocityTracker()
         poly_poller = PolymarketPoller(
             condition_ids=condition_ids,
-            tracker=poly_tracker,
+            tracker=tracker,
             mapper=mapper,
         )
         coroutines.append(
@@ -206,10 +317,15 @@ async def main() -> None:
                 logger.warning("cancel_all on shutdown failed: %s", exc)
 
         positions = client.get_positions()
+        factor_exposure = exposure_manager.get_factor_exposure()
         print("\n=== Shutdown Summary ===")
         print(f"  signals fired  : {_signal_count}")
         print(f"  orders placed  : {_order_count}")
         print(f"  open positions : {len(positions)}")
+        if factor_exposure:
+            print("  factor exposure:")
+            for factor, pct in sorted(factor_exposure.items()):
+                print(f"    {factor}: {pct*100:.1f}%")
         print("========================")
 
 

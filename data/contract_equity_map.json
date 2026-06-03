@@ -4,71 +4,87 @@
     "direction": "up",
     "basket": ["JPM", "BAC", "WFC", "GS", "MS", "XLF"],
     "sector_etf": "XLF",
+    "sector": "financials",
     "confidence": 0.9,
     "exit_hours": 2,
-    "exit_adverse_pct": 0.03
+    "exit_adverse_pct": 0.03,
+    "macro_factors": ["rates", "credit"]
   },
   "KXCPI": {
     "description": "Consumer Price Index release",
     "direction": "down",
     "basket": ["TLT", "GLD", "TIP"],
     "sector_etf": "TLT",
+    "sector": "commodities",
     "confidence": 0.85,
     "exit_hours": 2,
-    "exit_adverse_pct": 0.03
+    "exit_adverse_pct": 0.03,
+    "macro_factors": ["inflation", "rates"]
   },
   "KXPCE": {
     "description": "Personal Consumption Expenditures inflation",
     "direction": "down",
     "basket": ["TLT", "GLD", "SCHP"],
     "sector_etf": "TLT",
+    "sector": "commodities",
     "confidence": 0.8,
     "exit_hours": 2,
-    "exit_adverse_pct": 0.03
+    "exit_adverse_pct": 0.03,
+    "macro_factors": ["inflation", "rates"]
   },
   "KXJOBS": {
     "description": "Non-farm payrolls / unemployment",
     "direction": "up",
     "basket": ["XLY", "JPM", "BAC", "HD", "AMZN"],
     "sector_etf": "XLY",
+    "sector": "consumer_staples",
     "confidence": 0.7,
     "exit_hours": 2,
-    "exit_adverse_pct": 0.03
+    "exit_adverse_pct": 0.03,
+    "macro_factors": ["risk_off", "credit"]
   },
   "KXOIL": {
     "description": "Crude oil price level",
     "direction": "up",
     "basket": ["XOM", "CVX", "OXY", "XLE"],
     "sector_etf": "XLE",
+    "sector": "energy",
     "confidence": 0.8,
     "exit_hours": 1,
-    "exit_adverse_pct": 0.03
+    "exit_adverse_pct": 0.03,
+    "macro_factors": ["energy", "inflation"]
   },
   "KXGLD": {
     "description": "Gold price level",
     "direction": "up",
     "basket": ["GLD", "IAU", "NEM", "GOLD"],
     "sector_etf": "GLD",
+    "sector": "commodities",
     "confidence": 0.8,
     "exit_hours": 2,
-    "exit_adverse_pct": 0.03
+    "exit_adverse_pct": 0.03,
+    "macro_factors": ["inflation", "risk_off"]
   },
   "KXSPY": {
     "description": "S&P 500 daily close level",
     "direction": "up",
     "basket": ["SPY", "QQQ"],
     "sector_etf": "SPY",
+    "sector": "broad_market",
     "confidence": 0.75,
     "exit_hours": 1,
-    "exit_adverse_pct": 0.02
+    "exit_adverse_pct": 0.02,
+    "macro_factors": ["risk_off"]
   },
   "KXBTC": {
     "description": "Bitcoin price level",
     "direction": "up",
     "basket": ["MSTR", "COIN", "MARA", "RIOT"],
     "sector_etf": "BITO",
+    "sector": "technology",
     "confidence": 0.75,
     "exit_hours": 1,
-    "exit_adverse_pct": 0.05
+    "exit_adverse_pct": 0.05,
+    "macro_factors": ["risk_off"]
   }
 }

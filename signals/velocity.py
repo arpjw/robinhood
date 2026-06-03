@@ -82,6 +82,12 @@ class VelocityTracker:
         self.history_minutes = history_minutes
         self._history: dict[str, deque[PricePoint]] = defaultdict(deque)
 
+    def get_current_velocity(self, slug: str) -> float | None:
+        history = self._history.get(slug)
+        if not history or len(history) < 2:
+            return None
+        return compute_velocity(list(history), self.window_minutes)
+
     def update(self, slug: str, point: PricePoint) -> VelocitySignal | None:
         history = self._history[slug]
         history.append(point)

@@ -63,6 +63,32 @@ When this engine fires a signal, the interpretation is: prediction market partic
 
 ## Contract to Equity Mapping
 
+### Schema
+
+Each entry in `data/contract_equity_map.json` follows this structure:
+
+```json
+{
+  "KXFED": {
+    "description": "Federal Reserve rate decision",
+    "direction": "up",
+    "basket": ["JPM", "BAC", "WFC", "GS", "MS", "XLF"],
+    "sector_etf": "XLF",
+    "sector": "financials",
+    "confidence": 0.9,
+    "exit_hours": 2,
+    "exit_adverse_pct": 0.03,
+    "macro_factors": ["rates", "credit"]
+  }
+}
+```
+
+`direction` specifies whether a probability increase is bullish (`"up"`) or bearish (`"down"`) for the basket.
+
+`sector` is used by the sector deduplicator. Valid values: `financials`, `utilities`, `energy`, `consumer_staples`, `technology`, `commodities`, `broad_market`.
+
+`macro_factors` is used by the ExposureManager to track correlated risk. A basket exposed to `["rates", "credit"]` counts toward both factors when checking exposure caps. Valid values: `rates`, `inflation`, `energy`, `credit`, `risk_off`.
+
 ### Mapping Philosophy
 
 Every prediction market contract that this engine can trade on must have a corresponding entry in `data/contract_equity_map.json`. This is a hand-curated mapping that specifies which equities or ETFs are correlated with a given contract, in which direction, and with how much confidence.
@@ -141,13 +167,20 @@ The deduplication key is the equity basket, not the contract. Two different cont
 flowchart LR
     KW[Kalshi WebSocket] --> V[VelocityTracker]
     KR[Kalshi REST fallback] --> V
-    P[Polymarket CLOB] --> V
-    V --> D[SignalDeduplicator]
+    PW[Polymarket WebSocket] --> V
+    PR[Polymarket REST fallback] --> V
+    V --> MH[MarketHoursGuard]
+    MH -- open --> D[SignalDeduplicator]
+    MH -- closed/queue --> Q[Off-Hours Queue]
+    Q -- market opens --> D
     D --> A[Alerter]
-    D --> S[Sizer + ConfidenceDecay]
+    D --> EM[ExposureManager]
+    EM -- can_open --> S[Sizer + ConfidenceDecay]
     S --> M[MCPClient]
     M --> R[Robinhood]
     M --> E[ExitManager]
+    E -- register_close --> EM
+    V --> E
     A --> WH[Discord/Slack Webhook]
 ```
 
@@ -190,6 +223,46 @@ This means the default behavior of running the engine without any configuration 
 ### Layered Safety Model
 
 The safety model has four independent layers. First, mock mode is the default and live mode must be explicitly opted into. Second, position sizes are capped per trade at `max_position_pct` of portfolio value. Third, the isolated account limits blast radius at the account level. Fourth, the exit manager enforces time and price stops even if the entry logic produced an oversized or misdirected position. Each layer operates independently so a failure in one does not disable the others.
+
+---
+
+## V3 Improvements
+
+### Portfolio Exposure Limits (Risk Critical)
+
+Individual position caps (5% per trade) prevent any single position from being oversized, but they do not prevent correlated signals from stacking into a concentrated macro bet. If three signals all map to rate-sensitive equities and all fire within a 30-minute window, the engine could end up with 15% of the portfolio in the same macro factor even though each individual position was within limits.
+
+`execution/exposure_manager.py` enforces aggregate portfolio exposure limits by macro factor. Each contract in `data/contract_equity_map.json` carries a `macro_factors` list identifying which macro themes the basket is exposed to (e.g., `["rates", "credit"]`). ExposureManager tracks running notional per factor across all open positions and blocks any new order that would breach a factor cap.
+
+`MAX_FACTOR_EXPOSURE_PCT=0.15` caps any single macro factor at 15% of portfolio value. `MAX_TOTAL_EXPOSURE_PCT=0.40` caps total notional across all positions at 40% regardless of factors. Both are checked before any order is submitted. Suppressed orders log a WARNING with the reason but do not fire an alert; exposure suppression is a normal operating condition, not an error.
+
+### Market Hours Awareness
+
+Prediction markets run 24/7. Equity markets do not. A contract that spikes at 2am ET is a real signal, but the equity expression cannot be executed until 9:30am. By then, the information has likely fully diffused and the edge is gone.
+
+`signals/market_hours.py` implements a `MarketHoursGuard` class that is aware of NYSE trading hours and holidays using the `pandas_market_calendars` library. Pre-market (before 9:30am ET) and post-market (after 4:00pm ET) are treated identically to closed.
+
+`OFF_HOURS_MODE=suppress` (default) drops any signal that fires outside market hours and logs the contract, velocity, and minutes until open.
+
+`OFF_HOURS_MODE=queue` stores off-hours signals in memory and replays them at market open. Replay multiplies the position size by `edge_decay_factor(signal_timestamp)`: a signal that fired 30 minutes before open gets approximately 0.5x size (half the edge remains), and a signal that fired 6+ hours before open has 0.0 decay and is dropped at replay time. The decay model: `max(0.0, 1.0 - hours_to_open / EDGE_HALF_LIFE_HOURS)`.
+
+### Reverse Velocity Exit
+
+The thesis is symmetric. If a sharp probability increase was the reason to enter, a sharp probability decrease in the same contract is new information that the initial signal was wrong. Waiting for the 2-hour time stop is too slow in this case — the information content of the reversal is the exit signal.
+
+`REVERSE_VELOCITY_THRESHOLD=0.20` (slightly higher than the entry threshold of 0.15 to filter noise) triggers an immediate exit when the current velocity for the entry contract is opposite in sign to the entry velocity and its magnitude exceeds the threshold. The ExitManager checks this condition on every loop cycle, before the time and price checks. Exits via reverse velocity log a WARNING with entry velocity, current velocity, and hold time — these are the most informative events for calibrating whether the entry threshold is set correctly.
+
+The `VelocityTracker` instance is shared between `KalshiPoller` and `ExitManager` rather than constructing separate trackers, so the ExitManager always sees the most recent computed velocity from live market data.
+
+### Polymarket WebSocket
+
+`signals/polymarket_poller.py` now connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market` via WebSocket and streams `price_change` events in real time, replacing REST polling for primary data delivery. The same resilience pattern as the Kalshi poller: exponential backoff (1s, 2s, 4s, 8s, 16s) on connection failure, fall back to REST polling after 5 consecutive failures with a WARNING log. Set `POLYMARKET_USE_WEBSOCKET=false` to force REST mode.
+
+### Correlation-Aware Deduplication
+
+The existing deduplicator suppresses exact-slug duplicates within the DEDUP_WINDOW_MINUTES window, but it misses the case where two different contracts map to the same sector. XLF and JPM are in the same `financials` sector, and two signals that both map to financials create correlated exposure even though they pass the slug deduplication check.
+
+`MAX_CONCURRENT_SIGNALS_PER_SECTOR=2` caps the number of active signals per sector within the dedup window. Each contract in `data/contract_equity_map.json` now carries a `sector` field (`financials`, `utilities`, `energy`, `consumer_staples`, `technology`, `commodities`, `broad_market`). If a new signal's sector already has the maximum number of active signals, the new signal is suppressed with a WARNING logging the sector, the active slugs, and the suppressed slug. Slug deduplication runs first and independently. Set `SECTOR_DEDUP_ENABLED=false` to disable sector dedup while keeping slug dedup active.
 
 ---
 
@@ -266,6 +339,15 @@ python scripts/dashboard.py
 | `BACKTEST_LATENCY_SECONDS` | Execution latency between signal fire and fill | `5` | Applied as timestamp offset when looking up fill price |
 | `BACKTEST_SPREAD_BPS` | One-way spread cost applied at entry and exit | `5` | Combined with slippage; total round-trip = 2×spread + 2×slippage |
 | `CONFIDENCE_DECAY_ENABLED` | Adjust confidence by 7-day price centrality | `true` | Set to `false` to use static confidence values from the contract map |
+| `MAX_FACTOR_EXPOSURE_PCT` | Maximum total notional in any single macro factor as a fraction of portfolio | `0.15` | Blocks new orders when a factor exposure would exceed this threshold |
+| `MAX_TOTAL_EXPOSURE_PCT` | Maximum total notional across all open positions regardless of factor | `0.40` | Hard cap on gross exposure independent of factor caps |
+| `OFF_HOURS_MODE` | Behavior when a signal fires outside market hours | `suppress` | `suppress` drops the signal; `queue` stores it for replay at market open |
+| `EDGE_HALF_LIFE_HOURS` | Hours before market open at which an off-hours signal has zero edge | `1.0` | Used in the decay formula: `max(0, 1 - hours_to_open / half_life)` |
+| `REVERSE_VELOCITY_THRESHOLD` | Minimum reverse velocity magnitude to trigger an immediate exit | `0.20` | Set higher than entry threshold to avoid noise exits |
+| `REVERSE_VELOCITY_ENABLED` | Enable or disable reverse velocity exits | `true` | Set to `false` to disable without changing thresholds |
+| `POLYMARKET_USE_WEBSOCKET` | Use WebSocket feed for Polymarket instead of REST polling | `true` | Set to `false` to force REST fallback |
+| `MAX_CONCURRENT_SIGNALS_PER_SECTOR` | Maximum active signals per sector within the dedup window | `2` | Prevents correlated sector concentration from stacking |
+| `SECTOR_DEDUP_ENABLED` | Enable or disable sector-based deduplication | `true` | Slug dedup remains active independently when this is disabled |
 
 ---
 
@@ -274,16 +356,18 @@ python scripts/dashboard.py
 ```
 signals/
   kalshi_poller.py       # Kalshi WebSocket + REST fallback with RSA-PSS auth
-  polymarket_poller.py   # Polymarket CLOB polling
+  polymarket_poller.py   # Polymarket WebSocket + REST fallback
   velocity.py            # Δp/Δt computation and threshold filtering
   contract_mapper.py     # contract to equity basket lookup
-  deduplicator.py        # cross-source duplicate suppression
+  deduplicator.py        # slug and sector-based duplicate suppression
   confidence_decay.py    # 7-day centrality-based confidence adjustment
+  market_hours.py        # NYSE hours guard, off-hours queue, edge decay
 execution/
   mcp_client.py          # Mock and Live MCP client implementations
   order_schema.py        # Typed OrderRecord dataclass and log I/O
   sizer.py               # Velocity-weighted position sizing with confidence decay
-  exit_manager.py        # Time-decay and adverse-move exit logic
+  exit_manager.py        # Time, adverse-move, and reverse velocity exits
+  exposure_manager.py    # Macro factor exposure limits and position tracking
 backtest/
   simulate.py            # Historical signal replay with slippage/fill modeling
 scripts/
