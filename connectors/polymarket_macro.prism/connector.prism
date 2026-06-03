@@ -1,0 +1,18 @@
+prism: "1.0"
+name: "Polymarket Macro"
+slug: "polymarket_macro"
+version: "1.0.0"
+author: "arpjw"
+source_type: "prediction_market"
+transport: "websocket"
+description: "Streams macro prediction market prices from Polymarket's CLOB via WebSocket."
+auth_required: false
+auth_fields: []
+contract_slugs:
+  - KXFED
+  - KXCPI
+  - KXJOBS
+poll_interval_seconds: null
+capabilities:
+  - velocity
+  - volume

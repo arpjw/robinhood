@@ -33,6 +33,13 @@ def check(label: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
+def warn(label: str, detail: str = "") -> None:
+    line = f"  [WARN] {label}"
+    if detail:
+        line += f" — {detail}"
+    print(line)
+
+
 def main() -> None:
     all_ok = True
 
@@ -101,6 +108,42 @@ def main() -> None:
             ) and all_ok
         except json.JSONDecodeError as exc:
             all_ok = check("contract map is valid JSON", False, str(exc)) and all_ok
+
+    print("\n8. Prism connectors")
+    connectors_path = Path("connectors")
+    if not connectors_path.exists():
+        warn("connectors/ directory not found — no prism connectors available")
+    else:
+        from connectors.base import validate_manifest
+
+        prism_pkgs = sorted(
+            e for e in connectors_path.iterdir()
+            if e.is_dir() and e.name.endswith(".prism")
+        )
+        if not prism_pkgs:
+            warn("no .prism packages found in connectors/")
+        for pkg in prism_pkgs:
+            manifest_path = pkg / "connector.prism"
+            if not manifest_path.exists():
+                warn(f"{pkg.name}: missing connector.prism manifest")
+                continue
+            try:
+                manifest = validate_manifest(manifest_path)
+                check(f"{pkg.name}: manifest valid", True)
+            except ValueError as exc:
+                check(f"{pkg.name}: manifest valid", False, str(exc))
+                continue
+
+            if manifest.get("auth_required"):
+                missing = [f for f in manifest.get("auth_fields", []) if not os.getenv(f)]
+                if missing:
+                    warn(
+                        f"{pkg.name}: auth fields missing ({', '.join(missing)}) — connector will be skipped at runtime"
+                    )
+                else:
+                    check(f"{pkg.name}: auth fields present", True)
+            else:
+                check(f"{pkg.name}: auth not required", True)
 
     print()
     if all_ok:

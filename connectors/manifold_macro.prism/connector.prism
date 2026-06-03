@@ -1,0 +1,19 @@
+prism: "1.0"
+name: "Manifold Markets Macro"
+slug: "manifold_macro"
+version: "1.0.0"
+author: "arpjw"
+source_type: "prediction_market"
+transport: "rest"
+description: "Polls Manifold Markets for binary market probabilities on macro questions."
+auth_required: false
+auth_fields: []
+contract_slugs:
+  - KXFED
+  - KXCPI
+  - KXJOBS
+  - KXBTC
+poll_interval_seconds: 120
+capabilities:
+  - velocity
+  - volume

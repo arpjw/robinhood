@@ -28,7 +28,7 @@ export default function StackSection() {
             marginBottom: '48px',
           }}
         >
-          03 // STACK
+          04 // STACK
         </div>
 
         <div

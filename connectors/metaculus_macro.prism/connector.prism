@@ -1,0 +1,17 @@
+prism: "1.0"
+name: "Metaculus Macro Questions"
+slug: "metaculus_macro"
+version: "1.0.0"
+author: "arpjw"
+source_type: "prediction_market"
+transport: "rest"
+description: "Polls Metaculus for expert-aggregated probability on macro questions."
+auth_required: false
+auth_fields: []
+contract_slugs:
+  - KXFED
+  - KXCPI
+  - KXJOBS
+poll_interval_seconds: 300
+capabilities:
+  - velocity

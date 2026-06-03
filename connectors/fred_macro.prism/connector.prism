@@ -1,0 +1,18 @@
+prism: "1.0"
+name: "FRED Macro Indicators"
+slug: "fred_macro"
+version: "1.0.0"
+author: "arpjw"
+source_type: "alternative_data"
+transport: "rest"
+description: "Polls FRED for macro economic series normalized as pseudo-probability signals."
+auth_required: true
+auth_fields:
+  - FRED_API_KEY
+contract_slugs:
+  - KXFED
+  - KXCPI
+  - KXJOBS
+poll_interval_seconds: 3600
+capabilities:
+  - velocity

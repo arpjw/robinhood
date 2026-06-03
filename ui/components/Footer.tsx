@@ -64,7 +64,7 @@ export default function Footer() {
               letterSpacing: '0.05em',
             }}
           >
-            v2.0 // 149 TESTS // MOCK MODE
+            v3.0 // 4 PRISM CONNECTORS // MOCK MODE
           </div>
         </div>
       </div>

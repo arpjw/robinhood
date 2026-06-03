@@ -30,7 +30,7 @@ export default function StatusSection() {
             marginBottom: '48px',
           }}
         >
-          04 // STATUS
+          06 // STATUS
         </div>
 
         <div

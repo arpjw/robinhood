@@ -13,15 +13,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from connectors.base import PrismRegistry
 from execution.exit_manager import ExitManager, TrackedPosition, yfinance_price_fetcher
 from execution.exposure_manager import ExposureManager
 from execution.mcp_client import make_client
 from execution.sizer import size_basket
 from signals.contract_mapper import ContractMapper
 from signals.deduplicator import SignalDeduplicator
-from signals.kalshi_poller import KalshiPoller
 from signals.market_hours import MarketHoursGuard
-from signals.polymarket_poller import PolymarketPoller
 from signals.velocity import VelocitySignal, VelocityTracker
 
 logging.basicConfig(
@@ -173,18 +172,15 @@ async def _queue_replay_worker(
 def _print_startup_banner(
     dry_run: bool,
     mode: str,
-    tracked: list[str],
     hours_guard: MarketHoursGuard,
     exposure_manager: ExposureManager,
+    registry: PrismRegistry,
 ) -> None:
     mapper_path = "data/contract_equity_map.json"
     try:
         contract_count = len(json.loads(Path(mapper_path).read_text()))
     except Exception:
-        contract_count = len(tracked)
-
-    polymarket_ids = os.getenv("POLYMARKET_CONDITION_IDS", "")
-    poly_count = len([x for x in polymarket_ids.split(",") if x.strip()]) if polymarket_ids else 0
+        contract_count = 0
 
     is_open = hours_guard.is_open()
     market_status = "OPEN" if is_open else "CLOSED"
@@ -192,6 +188,8 @@ def _print_startup_banner(
         mins = hours_guard.minutes_to_open()
         if mins is not None:
             market_status += f" (opens in {mins:.0f}m)"
+
+    connectors = registry.get_all()
 
     banner = "DRY RUN MODE — forced mock execution" if dry_run else ""
     print("=" * 60)
@@ -203,12 +201,13 @@ def _print_startup_banner(
     print(f"  velocity threshold  : {os.getenv('VELOCITY_THRESHOLD', '0.15')}")
     print(f"  velocity window     : {os.getenv('VELOCITY_WINDOW_MINUTES', '5')}m")
     print(f"  contracts tracked   : {contract_count}")
-    print(f"  kalshi tickers      : {len(tracked)}")
-    print(f"  polymarket ids      : {poly_count}")
     print(f"  market hours status : {market_status}")
     print(f"  off hours mode      : {os.getenv('OFF_HOURS_MODE', 'suppress')}")
     print(f"  max factor exposure : {os.getenv('MAX_FACTOR_EXPOSURE_PCT', '0.15')}")
     print(f"  max total exposure  : {os.getenv('MAX_TOTAL_EXPOSURE_PCT', '0.40')}")
+    print(f"  prism connectors    : {len(connectors)}")
+    for c in connectors:
+        print(f"    - {c.metadata.name} ({c.metadata.slug})")
     print("=" * 60)
 
 
@@ -228,11 +227,6 @@ async def main() -> None:
 
     mode = os.getenv("EXECUTION_MODE", "mock")
 
-    api_key = os.environ.get("KALSHI_API_KEY")
-    if not api_key:
-        logger.error("KALSHI_API_KEY not set")
-        sys.exit(1)
-
     mapper = ContractMapper()
     client = make_client()
     deduplicator = SignalDeduplicator()
@@ -249,49 +243,33 @@ async def main() -> None:
         exposure_manager=exposure_manager,
     )
 
-    tickers_env = os.getenv("KALSHI_TICKERS", "")
-    if tickers_env:
-        tracked = [t.strip() for t in tickers_env.split(",") if t.strip()]
-    else:
-        tracked = mapper.get_all_slugs()
+    registry = PrismRegistry()
+    n = registry.load_directory(Path("connectors"))
+    custom_path = Path("connectors/custom")
+    if custom_path.exists():
+        n += registry.load_directory(custom_path)
+    if n == 0:
         logger.warning(
-            "KALSHI_TICKERS not set — using series keys as tickers. "
-            "Set to specific market tickers for production."
+            "no prism connectors loaded — check auth env vars and connectors/ directory"
         )
 
-    _print_startup_banner(args.dry_run, mode, tracked, hours_guard, exposure_manager)
-
-    polymarket_env = os.getenv("POLYMARKET_CONDITION_IDS", "")
-    condition_ids = [x.strip() for x in polymarket_env.split(",") if x.strip()]
-
-    interval = float(os.getenv("POLL_INTERVAL_SECONDS", "30"))
-    poller = KalshiPoller(api_key=api_key, tracked_tickers=tracked, tracker=tracker)
+    _print_startup_banner(args.dry_run, mode, hours_guard, exposure_manager, registry)
 
     async def _on_signal(sig: VelocitySignal) -> None:
         await handle_signal(
             sig, mapper, client, exit_manager, deduplicator, exposure_manager, hours_guard
         )
 
-    coroutines = [
-        poller.run(interval_seconds=interval, on_signal=_on_signal),
-        exit_manager.run(),
-    ]
+    coroutines: list = [exit_manager.run()]
+
+    for connector in registry.get_all():
+        coroutines.append(connector.start(tracker, mapper, _on_signal))
 
     if os.getenv("OFF_HOURS_MODE", "suppress") == "queue":
         coroutines.append(
             _queue_replay_worker(
                 hours_guard, mapper, client, exit_manager, deduplicator, exposure_manager
             )
-        )
-
-    if condition_ids:
-        poly_poller = PolymarketPoller(
-            condition_ids=condition_ids,
-            tracker=tracker,
-            mapper=mapper,
-        )
-        coroutines.append(
-            poly_poller.run(interval_seconds=interval, on_signal=_on_signal)
         )
 
     loop = asyncio.get_running_loop()
@@ -310,6 +288,9 @@ async def main() -> None:
     except asyncio.CancelledError:
         pass
     finally:
+        for connector in registry.get_all():
+            await connector.stop()
+
         if mode == "live":
             try:
                 client.cancel_all("*")
