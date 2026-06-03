@@ -1,5 +1,7 @@
 # Robinhood Velocity Signal Engine
 
+[![PyPI](https://img.shields.io/pypi/v/prism-signal)](https://pypi.org/project/prism-signal/)
+
 A prediction market velocity signal engine that fires equity trades when contract implied-probability moves sharply, capturing the latency gap before equity markets reprice the same information.
 
 ---
@@ -337,6 +339,16 @@ python main.py --dry-run
 | `fred_macro.prism` | `fred_macro` | FRED API | REST | Yes (`FRED_API_KEY`) | Fetches FRED economic series (CPI, unemployment, etc.) and normalizes via rolling 52-week min-max to probability signals |
 
 For the full developer guide including manifest field reference, normalization requirements, and the `PrismConnector` interface contract, see [CONTRIBUTING_CONNECTORS.md](CONTRIBUTING_CONNECTORS.md).
+
+---
+
+## Built on Prism
+
+The engine's connector layer is built on the [.prism framework](https://github.com/arpjw/prism) — an open-source plugin system for wiring any time-series data source into a velocity signal engine. Connectors are self-describing `.prism` packages that declare their own auth requirements, contract slugs, and transport mechanism, and are loaded automatically at startup without any changes to core engine code. Browse and discover community connectors at [prism.aryasomu.com](https://prism.aryasomu.com), or install the SDK to build your own:
+
+```bash
+pip install prism-signal
+```
 
 ---
 
