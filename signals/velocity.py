@@ -6,6 +6,8 @@ import os
 VELOCITY_THRESHOLD = float(os.getenv("VELOCITY_THRESHOLD", "0.15"))
 VELOCITY_WINDOW_MINUTES = int(os.getenv("VELOCITY_WINDOW_MINUTES", "5"))
 
+_MIN_DT_MINUTES = 0.5  # 30-second floor; sub-30s windows produce unreliable velocity from WS tick bursts
+
 
 @dataclass
 class PricePoint:
@@ -33,7 +35,7 @@ def compute_velocity(points: list[PricePoint], window_minutes: int) -> float:
         return 0.0
     dp = window[-1].price - window[0].price
     dt = (window[-1].timestamp - window[0].timestamp).total_seconds() / 60.0
-    if dt == 0.0:
+    if dt < _MIN_DT_MINUTES:
         return 0.0
     return dp / dt
 

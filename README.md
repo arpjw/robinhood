@@ -133,6 +133,16 @@ flowchart LR
 
 ---
 
+## V4 Improvements
+
+**LLM Signal Gatekeeper** — `SignalGatekeeper` sits between `SignalDeduplicator` and `Sizer`. Signals above `VELOCITY_THRESHOLD * GATEKEEPER_FAST_PATH_MULTIPLIER` (default 2×) are passed through immediately with no LLM call. Signals in the borderline band (≥ threshold, < 2× threshold) are evaluated by `claude-sonnet-4-6` with adaptive thinking; the model returns `{approved, confidence, reason}`. On any LLM failure the gate defaults to approved so the signal path is never blocked by infrastructure. Every decision (fast or gated) is logged to `logs/gatekeeper.jsonl`. Set `GATEKEEPER_SCALE_POSITION=true` to multiply position size by the model's confidence score on gated approvals.
+
+**Parallel Dual-Source Polling** — `ParallelPoller` runs `KalshiPoller.poll_once` and `PolymarketPoller.poll_once` concurrently via `asyncio.gather`. Errors in either source are isolated — one failure does not suppress signals from the other. Wall-clock and per-source timing are logged to `logs/signals.jsonl` as `type: "poll_timing"` entries.
+
+**Session Memory** — `SessionMemory` in `main.py` tracks signals fired, suppressed, and gatekeeper-approved for the current process lifetime, plus open position count and a rolling tail of closed-trade P&L from `logs/orders.jsonl`. A snapshot is written to `logs/session_state.jsonl` after every signal event. Disable with `SESSION_MEMORY_ENABLED=false`.
+
+---
+
 ## V3 Improvements
 
 **Portfolio Exposure Limits** — `ExposureManager` enforces `MAX_FACTOR_EXPOSURE_PCT=0.15` per macro factor and `MAX_TOTAL_EXPOSURE_PCT=0.40` total. Checks run before every order; suppressed orders log a WARNING.
@@ -158,6 +168,33 @@ flowchart LR
 **Confidence Decay** — sizing adjusts confidence by 7-day price centrality: 0.5× at the 7-day extreme, 1.0× at midpoint. Disable with `CONFIDENCE_DECAY_ENABLED=false`.
 
 **Live Dashboard** — `scripts/dashboard.py` renders a rich terminal view from `logs/orders.jsonl`, refreshing every 5 seconds with summary metrics, win rates, open positions with unrealized P&L, and recent activity.
+
+---
+
+## Oracle
+
+The Oracle is a continuous signal evaluation system that runs alongside the engine. It reads `logs/signals.jsonl` and `logs/orders.jsonl`, computes per-connector quality metrics (IC, Sharpe, win rate), detects the current macro regime, tunes velocity thresholds, and publishes connector reputation scores to `oracle/output/`. It never writes to `logs/` and never blocks the signal pipeline.
+
+```bash
+python scripts/run_oracle.py run --once     # single evaluation pass
+python scripts/run_oracle.py run            # continuous (every 5 minutes)
+python scripts/run_oracle.py report         # print current scores to terminal
+```
+
+### Output Files
+
+| File | Description | Updated by |
+|------|-------------|------------|
+| `oracle/output/scores.json` | Reputation score (0–100) per connector | `OracleRunner.run_once` |
+| `oracle/output/ic_report.json` | Information coefficient per connector | `OracleRunner.run_once` |
+| `oracle/output/decay_curves.json` | Signal decay curves per connector | `OracleRunner.run_once` |
+| `oracle/output/thresholds.json` | Recommended velocity thresholds | `OracleRunner.run_once` |
+| `oracle/output/regime.json` | Current macro regime and multipliers | `OracleRunner.run_once` |
+| `oracle/output/summary.json` | Human-readable run summary | `OracleRunner.run_once` |
+
+### Publishing to Prism Registry
+
+Set `PRISM_GITHUB_TOKEN` to a GitHub PAT with `contents:write` on the `arpjw/prism` repo, then run with `--publish`. The oracle will update `reputation_score`, `reputation_label`, and `scores_updated_at` for each connector in `registry/registry.json`.
 
 ---
 
@@ -256,6 +293,13 @@ python scripts/dashboard.py
 | `POLYMARKET_USE_WEBSOCKET` | Use WebSocket for Polymarket | `true` |
 | `MAX_CONCURRENT_SIGNALS_PER_SECTOR` | Active signal cap per sector | `2` |
 | `SECTOR_DEDUP_ENABLED` | Enable sector-based deduplication | `true` |
+| `ANTHROPIC_API_KEY` | Anthropic API key for gatekeeper LLM calls | required if `GATEKEEPER_ENABLED=true` |
+| `GATEKEEPER_ENABLED` | Enable LLM-based borderline signal filter | `true` |
+| `GATEKEEPER_FAST_PATH_MULTIPLIER` | Velocity ≥ threshold × multiplier bypasses LLM | `2.0` |
+| `GATEKEEPER_SCALE_POSITION` | Scale position size by gatekeeper confidence | `false` |
+| `GATEKEEPER_LOG_PATH` | JSONL log for gatekeeper decisions | `logs/gatekeeper.jsonl` |
+| `SESSION_MEMORY_ENABLED` | Write rolling session snapshots to JSONL | `true` |
+| `SESSION_STATE_LOG_PATH` | Session snapshot log path | `logs/session_state.jsonl` |
 
 ---
 
@@ -265,9 +309,11 @@ python scripts/dashboard.py
 signals/
   kalshi_poller.py       # Kalshi WebSocket + REST fallback with RSA-PSS auth
   polymarket_poller.py   # Polymarket WebSocket + REST fallback
+  parallel_poller.py     # Concurrent Kalshi + Polymarket polling via asyncio.gather
   velocity.py            # Δp/Δt computation and threshold filtering
   contract_mapper.py     # contract to equity basket lookup
   deduplicator.py        # slug and sector-based duplicate suppression
+  gatekeeper.py          # LLM-based borderline signal filter (fast path + gated path)
   confidence_decay.py    # 7-day centrality-based confidence adjustment
   market_hours.py        # NYSE hours guard, off-hours queue, edge decay
 execution/

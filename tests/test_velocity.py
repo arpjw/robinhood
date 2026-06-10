@@ -45,6 +45,23 @@ class TestComputeVelocity:
         ]
         assert compute_velocity(points, 5) == 0.0
 
+    def test_sub_30s_dt_returns_zero(self) -> None:
+        ts = datetime.now(tz=timezone.utc)
+        points = [
+            PricePoint(timestamp=ts, price=0.1, volume=100),
+            PricePoint(timestamp=ts + timedelta(seconds=10), price=0.9, volume=200),
+        ]
+        assert compute_velocity(points, 5) == 0.0
+
+    def test_exactly_30s_dt_computes_velocity(self) -> None:
+        ts = datetime.now(tz=timezone.utc)
+        points = [
+            PricePoint(timestamp=ts, price=0.5, volume=100),
+            PricePoint(timestamp=ts + timedelta(seconds=30), price=0.7, volume=200),
+        ]
+        v = compute_velocity(points, 5)
+        assert v == pytest.approx(0.2 / 0.5)
+
     def test_returns_zero_when_all_points_outside_window(self) -> None:
         points = [make_point(30, 0.5, 100), make_point(25, 0.7, 200)]
         assert compute_velocity(points, 5) == 0.0

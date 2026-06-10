@@ -31,7 +31,9 @@ load_dotenv()
 
 ORDER_LOG_PATH = Path(os.getenv("ORDER_LOG_PATH", "logs/orders.jsonl"))
 SIGNAL_LOG_PATH = Path(os.getenv("SIGNAL_LOG_PATH", "logs/signals.jsonl"))
+ORACLE_OUTPUT_DIR = Path(os.getenv("ORACLE_OUTPUT_DIR", "oracle/output"))
 REFRESH_SECONDS = 5
+ORACLE_STALE_MINUTES = 10
 
 
 def _parse_iso(s: str) -> datetime:
@@ -283,6 +285,148 @@ def build_activity_panel(order_log: Path, signal_log: Path) -> Panel:
     return Panel(table, title="[bold]Recent Activity[/bold]", border_style="white")
 
 
+def _load_json(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def _is_stale(computed_at: str | None) -> bool:
+    if not computed_at:
+        return True
+    try:
+        ts = datetime.fromisoformat(computed_at)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age_minutes = (datetime.now(tz=timezone.utc) - ts).total_seconds() / 60
+        return age_minutes > ORACLE_STALE_MINUTES
+    except Exception:
+        return True
+
+
+def build_oracle_scores_panel(oracle_dir: Path) -> Panel:
+    scores_path = oracle_dir / "scores.json"
+    if not scores_path.exists():
+        return Panel(
+            "[dim]Oracle not running. Start with:\n  python scripts/run_oracle.py[/dim]",
+            title="[bold]ORACLE: CONNECTOR SCORES[/bold]",
+            border_style="dim",
+        )
+
+    scores = _load_json(scores_path)
+    if scores is None:
+        return Panel("[red]Failed to read scores.json[/red]", title="[bold]ORACLE: CONNECTOR SCORES[/bold]")
+
+    stale = _is_stale(scores.get("computed_at"))
+    title = "[bold]ORACLE: CONNECTOR SCORES[/bold]"
+    if stale:
+        title += " [yellow][STALE][/yellow]"
+
+    label_colors = {
+        "EXCELLENT": "bright_green",
+        "GOOD": "green",
+        "MODERATE": "yellow",
+        "WEAK": "orange1",
+        "POOR": "red",
+    }
+
+    table = Table(show_header=True, header_style="bold magenta", expand=True)
+    table.add_column("Connector")
+    table.add_column("Score", justify="right")
+    table.add_column("Label")
+    table.add_column("Trades", justify="right")
+    table.add_column("Win%", justify="right")
+    table.add_column("IC", justify="right")
+    table.add_column("Sharpe", justify="right")
+    table.add_column("Updated")
+
+    connectors = scores.get("connectors", {})
+    sorted_connectors = sorted(
+        connectors.items(),
+        key=lambda x: x[1].get("reputation_score", 0),
+        reverse=True,
+    )
+    computed_at = scores.get("computed_at", "—")[:16]
+    for slug, data in sorted_connectors:
+        lbl = data.get("reputation_label", "—")
+        color = label_colors.get(lbl, "white")
+        ic_val = data.get("ic")
+        sharpe_val = data.get("sharpe")
+        win_rate = data.get("win_rate")
+        table.add_row(
+            slug,
+            str(data.get("reputation_score", 0)),
+            f"[{color}]{lbl}[/]",
+            str(data.get("trade_count", 0)),
+            f"{win_rate:.1%}" if win_rate is not None else "—",
+            f"{ic_val:.3f}" if ic_val is not None else "—",
+            f"{sharpe_val:.2f}" if sharpe_val is not None else "—",
+            computed_at,
+        )
+
+    return Panel(table, title=title, border_style="magenta")
+
+
+def build_oracle_regime_panel(oracle_dir: Path) -> Panel:
+    regime_path = oracle_dir / "regime.json"
+    summary_path = oracle_dir / "summary.json"
+
+    regime = _load_json(regime_path)
+    summary = _load_json(summary_path)
+
+    if regime is None and summary is None:
+        return Panel(
+            "[dim]No regime data.[/dim]",
+            title="[bold]ORACLE: REGIME + RECOMMENDATIONS[/bold]",
+            border_style="dim",
+        )
+
+    stale = _is_stale((regime or {}).get("detected_at"))
+    title = "[bold]ORACLE: REGIME + RECOMMENDATIONS[/bold]"
+    if stale:
+        title += " [yellow][STALE][/yellow]"
+
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bold cyan")
+    grid.add_column()
+
+    if regime:
+        regime_name = (regime.get("regime") or "unknown").upper()
+        conf = regime.get("confidence", 0)
+        grid.add_row("Regime:", f"[bold]{regime_name}[/bold] ({conf:.1%} confidence)")
+
+        eff_thresh = regime.get("effective_threshold")
+        eff_pos = regime.get("effective_position_pct")
+        base_thresh = float(os.getenv("VELOCITY_THRESHOLD", "0.15"))
+        base_pos = float(os.getenv("MAX_POSITION_PCT", "0.05"))
+
+        thresh_str = f"{eff_thresh}"
+        if eff_thresh is not None and abs(eff_thresh - base_thresh) > 0.001:
+            thresh_str = f"[yellow]{eff_thresh}[/yellow]"
+
+        pos_str = f"{eff_pos:.1%}" if eff_pos is not None else "—"
+        if eff_pos is not None and abs(eff_pos - base_pos) > 0.001:
+            pos_str = f"[yellow]{pos_str}[/yellow]"
+
+        grid.add_row("Eff. Threshold:", thresh_str)
+        grid.add_row("Eff. Position:", pos_str)
+        detected = (regime.get("detected_at") or "")[:16]
+        grid.add_row("Last computed:", detected)
+
+    if summary:
+        recs = summary.get("recommendations", [])[:5]
+        if recs:
+            grid.add_row("", "")
+            grid.add_row("[bold]Recommendations:[/bold]", "")
+            for rec in recs:
+                grid.add_row("  •", rec[:80])
+
+    return Panel(grid, title=title, border_style="cyan")
+
+
 def render(since: datetime | None = None) -> Layout:
     orders = load_orders(ORDER_LOG_PATH, since)
 
@@ -291,6 +435,7 @@ def render(since: datetime | None = None) -> Layout:
         Layout(name="top", size=10),
         Layout(name="mid", size=14),
         Layout(name="bottom"),
+        Layout(name="oracle_row", size=12),
     )
     layout["top"].update(build_summary_panel(orders))
     layout["mid"].split_row(
@@ -300,6 +445,10 @@ def render(since: datetime | None = None) -> Layout:
     layout["bottom"].split_column(
         Layout(build_open_positions_panel(orders), name="open", size=12),
         Layout(build_activity_panel(ORDER_LOG_PATH, SIGNAL_LOG_PATH), name="activity"),
+    )
+    layout["oracle_row"].split_row(
+        Layout(build_oracle_scores_panel(ORACLE_OUTPUT_DIR), name="oracle_scores"),
+        Layout(build_oracle_regime_panel(ORACLE_OUTPUT_DIR), name="oracle_regime"),
     )
     return layout
 

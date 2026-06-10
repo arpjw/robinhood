@@ -145,6 +145,67 @@ def main() -> None:
             else:
                 check(f"{pkg.name}: auth not required", True)
 
+    print("\n9. Oracle output")
+    oracle_scores = Path("oracle/output/scores.json")
+    if not oracle_scores.exists():
+        print("  [INFO] oracle/output/scores.json not found — oracle is optional, run scripts/run_oracle.py to enable")
+    else:
+        try:
+            data = json.loads(oracle_scores.read_text())
+            computed_at_str = data.get("computed_at", "")
+            if computed_at_str:
+                from datetime import datetime, timezone
+                computed_at = datetime.fromisoformat(computed_at_str)
+                if computed_at.tzinfo is None:
+                    computed_at = computed_at.replace(tzinfo=timezone.utc)
+                age_minutes = (datetime.now(tz=timezone.utc) - computed_at).total_seconds() / 60
+                if age_minutes > 60:
+                    warn("oracle output stale", f"last updated {age_minutes:.0f}m ago")
+                else:
+                    check("oracle output fresh", True, f"last updated {age_minutes:.0f}m ago")
+            else:
+                check("oracle output", True, "computed_at missing")
+        except Exception as exc:
+            warn("oracle output unreadable", str(exc))
+
+    print("\n10. Gatekeeper (Anthropic API)")
+    gatekeeper_enabled = os.getenv("GATEKEEPER_ENABLED", "true").lower() not in ("0", "false", "no")
+    if not gatekeeper_enabled:
+        print("  [INFO] GATEKEEPER_ENABLED=false — skipping Anthropic API check")
+    else:
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            warn("ANTHROPIC_API_KEY not set — gatekeeper will fail at runtime")
+        else:
+            check("ANTHROPIC_API_KEY present", True)
+            try:
+                import anthropic
+                from datetime import datetime, timezone
+                from signals.velocity import VelocitySignal
+
+                client = anthropic.Anthropic(api_key=api_key)
+                probe_signal = {
+                    "contract_id": "HEALTHCHECK",
+                    "source": "healthcheck",
+                    "velocity": 0.20,
+                    "threshold": 0.15,
+                    "velocity_window_minutes": 5,
+                    "dedup_window_minutes": 30,
+                    "equity_basket": [],
+                }
+                response = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=64,
+                    system='Respond with JSON only: {"approved": true, "confidence": 1.0, "reason": "healthcheck"}',
+                    messages=[{"role": "user", "content": json.dumps(probe_signal)}],
+                )
+                text = next((b.text for b in response.content if b.type == "text"), "").strip()
+                parsed = json.loads(text)
+                ok = "approved" in parsed and "confidence" in parsed
+                all_ok = check("Anthropic API reachable and gatekeeper response valid", ok) and all_ok
+            except Exception as exc:
+                all_ok = check("Anthropic API reachable", False, str(exc)) and all_ok
+
     print()
     if all_ok:
         print("All checks passed.")

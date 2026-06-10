@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ from execution.mcp_client import make_client
 from execution.sizer import size_basket
 from signals.contract_mapper import ContractMapper
 from signals.deduplicator import SignalDeduplicator
+from signals.gatekeeper import SignalGatekeeper
 from signals.market_hours import MarketHoursGuard
 from signals.velocity import VelocitySignal, VelocityTracker
 
@@ -35,6 +37,69 @@ _tasks: list[asyncio.Task] = []
 _off_hours_queue: list[VelocitySignal] = []
 
 
+class SessionMemory:
+    def __init__(self, max_entries: int = 50) -> None:
+        self._max = max_entries
+        self.signals_fired: int = 0
+        self.signals_suppressed: int = 0
+        self.signals_approved: int = 0
+        self._log_path = Path(os.getenv("SESSION_STATE_LOG_PATH", "logs/session_state.jsonl"))
+        self._order_log = Path(os.getenv("ORDER_LOG_PATH", "logs/orders.jsonl"))
+
+    def record_fired(self) -> None:
+        self.signals_fired += 1
+
+    def record_suppressed(self) -> None:
+        self.signals_suppressed += 1
+
+    def record_approved(self) -> None:
+        self.signals_approved += 1
+
+    def _load_recent_pnl(self) -> list[dict]:
+        if not self._order_log.exists():
+            return []
+        try:
+            lines = self._order_log.read_text().splitlines()
+            recent = []
+            for line in lines[-self._max:]:
+                try:
+                    r = json.loads(line)
+                    if r.get("pnl_usd") is not None:
+                        recent.append({
+                            "order_id": r.get("id"),
+                            "ticker": r.get("ticker"),
+                            "pnl_usd": r.get("pnl_usd"),
+                        })
+                except (json.JSONDecodeError, KeyError):
+                    pass
+            return recent
+        except OSError:
+            return []
+
+    def snapshot(self, client) -> dict:
+        try:
+            positions = client.get_positions()
+            open_count = len(positions)
+        except Exception:
+            open_count = 0
+        return {
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            "signals_fired": self.signals_fired,
+            "signals_suppressed": self.signals_suppressed,
+            "signals_approved": self.signals_approved,
+            "open_positions": open_count,
+            "recent_pnl": self._load_recent_pnl(),
+        }
+
+    def write_snapshot(self, client) -> None:
+        if os.getenv("SESSION_MEMORY_ENABLED", "true").lower() in ("0", "false", "no"):
+            return
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        snap = self.snapshot(client)
+        with self._log_path.open("a") as f:
+            f.write(json.dumps(snap) + "\n")
+
+
 def determine_side(velocity: float, direction: str) -> str:
     return "buy" if (velocity > 0) == (direction == "up") else "sell"
 
@@ -47,11 +112,15 @@ async def _submit_signal(
     deduplicator: SignalDeduplicator,
     exposure_manager: ExposureManager,
     size_multiplier: float = 1.0,
+    gatekeeper: SignalGatekeeper | None = None,
+    session_memory: SessionMemory | None = None,
 ) -> None:
     global _signal_count, _order_count
 
     if not deduplicator.should_fire(signal):
         logger.info("dedup: suppressing duplicate signal for %s", signal.contract_slug)
+        if session_memory:
+            session_memory.record_suppressed()
         return
 
     _signal_count += 1
@@ -59,6 +128,26 @@ async def _submit_signal(
     if basket is None:
         logger.info("no basket mapped for %s", signal.contract_slug)
         return
+
+    if gatekeeper is not None:
+        dedup_window = int(os.getenv("DEDUP_WINDOW_MINUTES", "30"))
+        signal = await gatekeeper.evaluate(
+            signal,
+            source=getattr(signal, "_source", "unknown"),
+            basket=basket,
+            dedup_window_minutes=dedup_window,
+        )
+        if signal is None:
+            if session_memory:
+                session_memory.record_suppressed()
+            return
+        if session_memory:
+            session_memory.record_approved()
+
+        if os.getenv("GATEKEEPER_SCALE_POSITION", "false").lower() not in ("0", "false", "no"):
+            gc = getattr(signal, "gatekeeper_confidence", None)
+            if gc is not None:
+                size_multiplier = size_multiplier * float(gc)
 
     side = determine_side(signal.velocity, basket["direction"])
     sizes = size_basket(basket, velocity=signal.velocity)
@@ -114,7 +203,12 @@ async def handle_signal(
     deduplicator: SignalDeduplicator,
     exposure_manager: ExposureManager,
     hours_guard: MarketHoursGuard,
+    gatekeeper: SignalGatekeeper | None = None,
+    session_memory: SessionMemory | None = None,
 ) -> None:
+    if session_memory:
+        session_memory.record_fired()
+
     if not hours_guard.is_open():
         mode = os.getenv("OFF_HOURS_MODE", "suppress")
         mins = hours_guard.minutes_to_open()
@@ -133,9 +227,17 @@ async def handle_signal(
                 signal.velocity,
                 f"{mins:.1f}" if mins is not None else "unknown",
             )
+        if session_memory:
+            session_memory.write_snapshot(client)
         return
 
-    await _submit_signal(signal, mapper, client, exit_manager, deduplicator, exposure_manager)
+    await _submit_signal(
+        signal, mapper, client, exit_manager, deduplicator, exposure_manager,
+        gatekeeper=gatekeeper,
+        session_memory=session_memory,
+    )
+    if session_memory:
+        session_memory.write_snapshot(client)
 
 
 async def _queue_replay_worker(
@@ -145,6 +247,8 @@ async def _queue_replay_worker(
     exit_manager: ExitManager,
     deduplicator: SignalDeduplicator,
     exposure_manager: ExposureManager,
+    gatekeeper: SignalGatekeeper | None = None,
+    session_memory: SessionMemory | None = None,
 ) -> None:
     was_open = hours_guard.is_open()
     while True:
@@ -165,6 +269,8 @@ async def _queue_replay_worker(
                 await _submit_signal(
                     sig, mapper, client, exit_manager, deduplicator, exposure_manager,
                     size_multiplier=decay,
+                    gatekeeper=gatekeeper,
+                    session_memory=session_memory,
                 )
         was_open = is_open
 
@@ -232,6 +338,8 @@ async def main() -> None:
     deduplicator = SignalDeduplicator()
     exposure_manager = ExposureManager()
     hours_guard = MarketHoursGuard()
+    gatekeeper = SignalGatekeeper()
+    session_memory = SessionMemory()
     exit_check_interval = float(os.getenv("EXIT_CHECK_INTERVAL_SECONDS", "60"))
 
     tracker = VelocityTracker()
@@ -257,7 +365,9 @@ async def main() -> None:
 
     async def _on_signal(sig: VelocitySignal) -> None:
         await handle_signal(
-            sig, mapper, client, exit_manager, deduplicator, exposure_manager, hours_guard
+            sig, mapper, client, exit_manager, deduplicator, exposure_manager, hours_guard,
+            gatekeeper=gatekeeper,
+            session_memory=session_memory,
         )
 
     coroutines: list = [exit_manager.run()]
@@ -268,7 +378,9 @@ async def main() -> None:
     if os.getenv("OFF_HOURS_MODE", "suppress") == "queue":
         coroutines.append(
             _queue_replay_worker(
-                hours_guard, mapper, client, exit_manager, deduplicator, exposure_manager
+                hours_guard, mapper, client, exit_manager, deduplicator, exposure_manager,
+                gatekeeper=gatekeeper,
+                session_memory=session_memory,
             )
         )
 

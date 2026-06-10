@@ -87,7 +87,7 @@ def _sign_request(
 
 
 def _normalize_price(cents: int) -> float:
-    return cents / 100.0
+    return max(0.0, min(1.0, cents / 100.0))
 
 
 def _log_signal(signal: VelocitySignal) -> None:

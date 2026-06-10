@@ -1,7 +1,7 @@
 import asyncio
 import json
 import pytest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -97,6 +97,27 @@ class TestWsMessageParsing:
         async def capture(s):
             signals.append(s)
 
+        base_ts = datetime.now(tz=timezone.utc) - timedelta(minutes=10)
+        prices = [(10, 1000), (25, 1500), (40, 2000), (55, 2500), (70, 3000)]
+
+        for i, (yes_price, volume) in enumerate(prices):
+            tick_ts = base_ts + timedelta(minutes=i * 2)
+            with patch("signals.kalshi_poller.datetime") as mock_dt:
+                mock_dt.now.return_value = tick_ts
+                raw = json.dumps({
+                    "type": "ticker",
+                    "msg": {"market_ticker": "KXFED", "yes_price": yes_price, "volume": volume},
+                })
+                await poller._handle_ws_message(raw, capture)
+
+        assert len(signals) > 0
+
+    @pytest.mark.asyncio
+    async def test_rapid_ws_ticks_do_not_produce_signals(self, poller: KalshiPoller) -> None:
+        signals = []
+        async def capture(s):
+            signals.append(s)
+
         for i in range(5):
             raw = json.dumps({
                 "type": "ticker",
@@ -108,7 +129,7 @@ class TestWsMessageParsing:
             })
             await poller._handle_ws_message(raw, capture)
 
-        assert len(signals) > 0
+        assert len(signals) == 0
 
 
 class TestWsFallbackToRest:
